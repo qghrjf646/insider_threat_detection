@@ -26,17 +26,35 @@ class Tensor:
         out = Tensor(self.data + other.data, (self, other), '+')
 
         # (3) define the backward function for this operation
+        def _reduce_to_shape(tensor, target_shape):
+            # reduce leading/broadcast dims of tensor to match target_shape by summing
+            x = tensor
+            # reduce leading dims
+            while x.dim() > len(target_shape):
+                x = x.sum(dim=0)
+            # reduce dims where target has size 1
+            for i, (cd, td) in enumerate(zip(x.shape, target_shape)):
+                if td == 1 and cd != 1:
+                    x = x.sum(dim=i, keepdim=True)
+            return x
+
         def _backward():
             self_contrib = out.grad
-            if self.grad.shape == () and self_contrib.shape != ():
-                self.grad += self_contrib.sum()
-            else:
+            try:
+                if self.grad.shape != self_contrib.shape:
+                    self_contrib = _reduce_to_shape(self_contrib, tuple(self.grad.shape))
                 self.grad += self_contrib
+            except Exception:
+                # fallback: sum to scalar
+                self.grad += self_contrib.sum()
+
             other_contrib = out.grad
-            if other.grad.shape == () and other_contrib.shape != ():
-                other.grad += other_contrib.sum()
-            else:
+            try:
+                if other.grad.shape != other_contrib.shape:
+                    other_contrib = _reduce_to_shape(other_contrib, tuple(other.grad.shape))
                 other.grad += other_contrib
+            except Exception:
+                other.grad += other_contrib.sum()
         out._backward = _backward
 
         # (4) return the new Tensor
@@ -51,17 +69,31 @@ class Tensor:
         out = Tensor(self.data * other.data, [self, other], '*')
 
         # (3) define the backward function for this operation
+        def _reduce_to_shape(tensor, target_shape):
+            x = tensor
+            while x.dim() > len(target_shape):
+                x = x.sum(dim=0)
+            for i, (cd, td) in enumerate(zip(x.shape, target_shape)):
+                if td == 1 and cd != 1:
+                    x = x.sum(dim=i, keepdim=True)
+            return x
+
         def _backward():
             self_contrib = out.grad * other.data
-            if self.grad.shape == () and self_contrib.shape != ():
-                self.grad += self_contrib.sum()
-            else:
+            try:
+                if self.grad.shape != self_contrib.shape:
+                    self_contrib = _reduce_to_shape(self_contrib, tuple(self.grad.shape))
                 self.grad += self_contrib
+            except Exception:
+                self.grad += self_contrib.sum()
+
             other_contrib = out.grad * self.data
-            if other.grad.shape == () and other_contrib.shape != ():
-                other.grad += other_contrib.sum()
-            else:
+            try:
+                if other.grad.shape != other_contrib.shape:
+                    other_contrib = _reduce_to_shape(other_contrib, tuple(other.grad.shape))
                 other.grad += other_contrib
+            except Exception:
+                other.grad += other_contrib.sum()
         out._backward = _backward
 
         # (4) return the new Tensor
@@ -98,7 +130,20 @@ class Tensor:
 
         # (4) return the new Tensor
         return out
+    
+    def T(self):
+        # Return a transposed view of this Tensor (for 2D tensors)
+        out = Tensor(self.data.t(), (self,), 'T')
+        def _backward():
+            self.grad += out.grad.t()
+        out._backward = _backward
+        return out
+
+    # alias
+    def t(self):
+        return self.T()
         # FIXED
+
 
     def build_topo(self, visited=None, topo=None):
         if self not in visited:
@@ -154,6 +199,37 @@ class Tensor:
 
     def __repr__(self):
         return f"Tensor(data={self.data}, grad={self.grad})"
+    
+    def sum(self, dim=None, keepdim=False):
+        if dim is None:
+            out = Tensor(self.data.sum(), (self,), 'sum')
+            def _backward():
+                if isinstance(out.grad, (int, float)):
+                    g = torch.tensor(out.grad, device=self.data.device)
+                else:
+                    g = out.grad
+                self.grad += g * torch.ones_like(self.data)
+            out._backward = _backward
+            return out
+        else:
+            out_data = self.data.sum(dim=dim, keepdim=keepdim)
+            out = Tensor(out_data, (self,), f'sum_dim_{dim}')
+            def _backward():
+                g = out.grad
+                if not keepdim:
+                    g = g.unsqueeze(dim)
+                # expand to input shape then add
+                self.grad += g.expand_as(self.data)
+            out._backward = _backward
+            return out
+
+    def mean(self, dim=None, keepdim=False):
+        if dim is None:
+            n = self.data.numel()
+            return self.sum() / n
+        else:
+            denom = self.data.size(dim)
+            return self.sum(dim=dim, keepdim=keepdim) / denom
     
 
 # Additional mathematical functions with reverse-mode autodiff    
@@ -265,14 +341,32 @@ def softmax_d(dual_number: Tensor):
     # FIXED
 
 def matmul(a: Tensor, b: Tensor):
+    # Coerce raw torch tensors or numpy arrays into our Tensor wrapper
+    a = a if isinstance(a, Tensor) else Tensor(a)
+    b = b if isinstance(b, Tensor) else Tensor(b)
+
     out = Tensor(torch.matmul(a.data, b.data), (a, b), 'matmul')
     def _backward():
-        if a.data.ndim == 2 and b.data.ndim == 1:
-            a_contrib = torch.matmul(out.grad.unsqueeze(-1), b.data.unsqueeze(0))
-            b_contrib = torch.matmul(a.data.mT, out.grad.unsqueeze(-1)).squeeze(-1)
+        og = out.grad
+        # handle 1D (vector) and 2D/batched cases
+        if og.ndim == 0:
+            # scalar gradient
+            a_contrib = og * b.data
+            b_contrib = og * a.data
+        elif og.ndim == 1:
+            # og is (n,) result of vector-matrix or matrix-vector
+            if a.data.ndim == 1 and b.data.ndim == 1:
+                a_contrib = og * b.data
+                b_contrib = og * a.data
+            else:
+                a_contrib = torch.matmul(og.unsqueeze(0), b.data.t()).squeeze(0)
+                b_contrib = torch.matmul(a.data.t(), og.unsqueeze(1)).squeeze(1)
         else:
-            a_contrib = torch.matmul(out.grad, b.data.mT)
-            b_contrib = torch.matmul(a.data.mT, out.grad)
+            # general case (matrix or batched matmul)
+            a_contrib = torch.matmul(og, b.data.transpose(-2, -1))
+            b_contrib = torch.matmul(a.data.transpose(-2, -1), og)
+
+        # accumulate gradients, handling scalar-stored grads
         if a.grad.shape == () and a_contrib.shape != ():
             a.grad += a_contrib.sum()
         else:
@@ -339,6 +433,29 @@ class LSTMCell:
         h = o * tanh_d(c)
         
         return h, c
+    
+    def forward_batch(self, x, h_prev, c_prev):
+        # x: (batch_size, input_size), h_prev: (batch_size, hidden_size), c_prev: (batch_size, hidden_size)
+        
+        # Forget gate
+        f = sigmoid_d(matmul(x, self.Wf.t()) + matmul(h_prev, self.Uf.t()) + self.bf)
+        
+        # Input gate
+        i = sigmoid_d(matmul(x, self.Wi.t()) + matmul(h_prev, self.Ui.t()) + self.bi)
+        
+        # Candidate values
+        c_tilde = tanh_d(matmul(x, self.Wc.t()) + matmul(h_prev, self.Uc.t()) + self.bc)
+        
+        # Cell state
+        c = f * c_prev + i * c_tilde
+        
+        # Output gate
+        o = sigmoid_d(matmul(x, self.Wo.t()) + matmul(h_prev, self.Uo.t()) + self.bo)
+        
+        # Hidden state
+        h = o * tanh_d(c)
+        
+        return h, c
 
 class LSTM:
     def __init__(self, input_size, hidden_size, num_layers=1):
@@ -362,6 +479,18 @@ class LSTM:
             h, c = self.cells[0].forward(x, h, c)
         
         return h  # final hidden state
+    
+    def forward_batch(self, x_batch):
+        # x_batch: (batch_size, seq_len, input_size)
+        batch_size, seq_len, _ = x_batch.shape
+        h = Tensor(torch.zeros(batch_size, self.hidden_size, device=device))
+        c = Tensor(torch.zeros(batch_size, self.hidden_size, device=device))
+        
+        for t in range(seq_len):
+            x_t = x_batch[:, t, :]  # (batch_size, input_size)
+            h, c = self.cells[0].forward_batch(x_t, h, c)
+        
+        return h  # (batch_size, hidden_size)
 
 class Linear:
     def __init__(self, in_features, out_features):
@@ -373,3 +502,7 @@ class Linear:
     
     def forward(self, x):
         return matmul(self.W, x) + self.b
+    
+    def forward_batch(self, x):
+        # x: (batch_size, in_features)
+        return matmul(x, self.W.t()) + self.b
